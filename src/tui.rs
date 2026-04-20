@@ -721,7 +721,7 @@ pub fn run(
         worker_loop(api, store, worker_session, cmd_rx, evt_tx);
     });
 
-    // Main loop
+    // Main event loop
     loop {
         terminal
             .draw(|frame| draw(frame, &mut app))
@@ -741,5 +741,397 @@ pub fn run(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn make_key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn make_ctrl_key(c: char) -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn test_app() -> App<'static> {
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        App::new("testuser".to_string(), cmd_tx)
+    }
+
+    // ── Home screen ─────────────────────────────────────────────────────
+
+    #[test]
+    fn home_starts_on_home_screen() {
+        let app = test_app();
+        assert_eq!(app.screen, Screen::Home);
+    }
+
+    #[test]
+    fn home_n_goes_to_notes() {
+        let mut app = test_app();
+        handle_input(&mut app, make_key(KeyCode::Char('n')));
+        assert_eq!(app.screen, Screen::Notes);
+    }
+
+    #[test]
+    fn home_d_goes_to_dms() {
+        let mut app = test_app();
+        handle_input(&mut app, make_key(KeyCode::Char('d')));
+        assert_eq!(app.screen, Screen::DMList);
+    }
+
+    #[test]
+    fn home_q_returns_quit() {
+        let mut app = test_app();
+        let quit = handle_input(&mut app, make_key(KeyCode::Char('q')));
+        assert!(quit);
+    }
+
+    #[test]
+    fn home_esc_returns_quit() {
+        let mut app = test_app();
+        let quit = handle_input(&mut app, make_key(KeyCode::Esc));
+        assert!(quit);
+    }
+
+    #[test]
+    fn home_random_key_does_nothing() {
+        let mut app = test_app();
+        let quit = handle_input(&mut app, make_key(KeyCode::Char('x')));
+        assert!(!quit);
+        assert_eq!(app.screen, Screen::Home);
+    }
+
+    // ── Notes screen ────────────────────────────────────────────────────
+
+    #[test]
+    fn notes_esc_goes_home() {
+        let mut app = test_app();
+        app.screen = Screen::Notes;
+        handle_input(&mut app, make_key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Home);
+    }
+
+    #[test]
+    fn notes_ctrl_s_empty_sets_status() {
+        let mut app = test_app();
+        app.screen = Screen::Notes;
+        handle_input(&mut app, make_ctrl_key('s'));
+        assert_eq!(app.status, "empty");
+    }
+
+    #[test]
+    fn notes_ctrl_l_clears_textarea() {
+        let mut app = test_app();
+        app.screen = Screen::Notes;
+        handle_input(&mut app, make_key(KeyCode::Char('h')));
+        handle_input(&mut app, make_key(KeyCode::Char('i')));
+        assert!(!app.textarea.lines().join("").is_empty());
+        handle_input(&mut app, make_ctrl_key('l'));
+        assert!(app.textarea.lines().join("").is_empty());
+    }
+
+    #[test]
+    fn notes_typing_adds_to_textarea() {
+        let mut app = test_app();
+        app.screen = Screen::Notes;
+        handle_input(&mut app, make_key(KeyCode::Char('a')));
+        handle_input(&mut app, make_key(KeyCode::Char('b')));
+        assert_eq!(app.textarea.lines().join(""), "ab");
+    }
+
+    #[test]
+    fn notes_ctrl_s_too_long_sets_error() {
+        let mut app = test_app();
+        app.screen = Screen::Notes;
+        for _ in 0..61 {
+            handle_input(&mut app, make_key(KeyCode::Char('x')));
+        }
+        handle_input(&mut app, make_ctrl_key('s'));
+        assert!(app.status.contains("too long"));
+    }
+
+    // ── DM list screen ──────────────────────────────────────────────────
+
+    #[test]
+    fn dm_list_esc_goes_home() {
+        let mut app = test_app();
+        app.screen = Screen::DMList;
+        handle_input(&mut app, make_key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Home);
+    }
+
+    #[test]
+    fn dm_list_j_k_navigation() {
+        let mut app = test_app();
+        app.screen = Screen::DMList;
+        app.threads = vec![
+            DirectThread {
+                thread_id: "1".to_string(),
+                thread_title: "Alice".to_string(),
+                usernames: vec!["alice".to_string()],
+                last_message: "hi".to_string(),
+            },
+            DirectThread {
+                thread_id: "2".to_string(),
+                thread_title: "Bob".to_string(),
+                usernames: vec!["bob".to_string()],
+                last_message: "yo".to_string(),
+            },
+        ];
+        app.thread_list_state.select(Some(0));
+
+        handle_input(&mut app, make_key(KeyCode::Char('j')));
+        assert_eq!(app.thread_list_state.selected(), Some(1));
+
+        handle_input(&mut app, make_key(KeyCode::Char('k')));
+        assert_eq!(app.thread_list_state.selected(), Some(0));
+
+        handle_input(&mut app, make_key(KeyCode::Char('k')));
+        assert_eq!(app.thread_list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn dm_list_j_doesnt_overflow() {
+        let mut app = test_app();
+        app.screen = Screen::DMList;
+        app.threads = vec![DirectThread {
+            thread_id: "1".to_string(),
+            thread_title: "Alice".to_string(),
+            usernames: vec![],
+            last_message: String::new(),
+        }];
+        app.thread_list_state.select(Some(0));
+
+        handle_input(&mut app, make_key(KeyCode::Char('j')));
+        assert_eq!(app.thread_list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn dm_list_enter_opens_thread() {
+        let mut app = test_app();
+        app.screen = Screen::DMList;
+        app.threads = vec![DirectThread {
+            thread_id: "thread_42".to_string(),
+            thread_title: "Alice".to_string(),
+            usernames: vec!["alice".to_string()],
+            last_message: "hi".to_string(),
+        }];
+        app.thread_list_state.select(Some(0));
+
+        handle_input(&mut app, make_key(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::DMThread("thread_42".to_string()));
+        assert_eq!(app.current_thread_id, "thread_42");
+        assert_eq!(app.current_thread_title, "Alice");
+    }
+
+    // ── DM thread screen ────────────────────────────────────────────────
+
+    #[test]
+    fn dm_thread_esc_goes_to_list() {
+        let mut app = test_app();
+        app.screen = Screen::DMThread("t1".to_string());
+        handle_input(&mut app, make_key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::DMList);
+    }
+
+    #[test]
+    fn dm_thread_typing_fills_input() {
+        let mut app = test_app();
+        app.screen = Screen::DMThread("t1".to_string());
+        handle_input(&mut app, make_key(KeyCode::Char('h')));
+        handle_input(&mut app, make_key(KeyCode::Char('i')));
+        assert_eq!(app.dm_input, "hi");
+    }
+
+    #[test]
+    fn dm_thread_backspace_removes_char() {
+        let mut app = test_app();
+        app.screen = Screen::DMThread("t1".to_string());
+        app.dm_input = "hello".to_string();
+        handle_input(&mut app, make_key(KeyCode::Backspace));
+        assert_eq!(app.dm_input, "hell");
+    }
+
+    #[test]
+    fn dm_thread_enter_empty_does_nothing() {
+        let mut app = test_app();
+        app.screen = Screen::DMThread("t1".to_string());
+        app.dm_input.clear();
+        handle_input(&mut app, make_key(KeyCode::Enter));
+        assert!(!app.status.contains("sending"));
+    }
+
+    #[test]
+    fn dm_thread_scroll_up_down() {
+        let mut app = test_app();
+        app.screen = Screen::DMThread("t1".to_string());
+        assert_eq!(app.dm_scroll, 0);
+
+        handle_input(&mut app, make_key(KeyCode::Up));
+        assert_eq!(app.dm_scroll, 1);
+        handle_input(&mut app, make_key(KeyCode::Up));
+        assert_eq!(app.dm_scroll, 2);
+        handle_input(&mut app, make_key(KeyCode::Down));
+        assert_eq!(app.dm_scroll, 1);
+        handle_input(&mut app, make_key(KeyCode::Down));
+        handle_input(&mut app, make_key(KeyCode::Down));
+        assert_eq!(app.dm_scroll, 0);
+    }
+
+    #[test]
+    fn dm_thread_r_refreshes_only_when_input_empty() {
+        let mut app = test_app();
+        app.screen = Screen::DMThread("t1".to_string());
+        app.current_thread_title = "Test".to_string();
+
+        handle_input(&mut app, make_key(KeyCode::Char('r')));
+        assert!(app.status.contains("loading"));
+
+        app.status.clear();
+        app.dm_input = "some text".to_string();
+        handle_input(&mut app, make_key(KeyCode::Char('r')));
+        assert_eq!(app.dm_input, "some textr");
+        assert!(app.status.is_empty());
+    }
+
+    // ── Login screen ────────────────────────────────────────────────────
+
+    #[test]
+    fn login_esc_quits() {
+        let mut app = test_app();
+        app.screen = Screen::Login;
+        let quit = handle_input(&mut app, make_key(KeyCode::Esc));
+        assert!(quit);
+    }
+
+    #[test]
+    fn login_tab_switches_field() {
+        let mut app = test_app();
+        app.screen = Screen::Login;
+        assert_eq!(app.login_field, 0);
+        handle_input(&mut app, make_key(KeyCode::Tab));
+        assert_eq!(app.login_field, 1);
+        handle_input(&mut app, make_key(KeyCode::Tab));
+        assert_eq!(app.login_field, 0);
+    }
+
+    #[test]
+    fn login_typing_fills_correct_field() {
+        let mut app = test_app();
+        app.screen = Screen::Login;
+        handle_input(&mut app, make_key(KeyCode::Char('u')));
+        assert_eq!(app.login_username, "u");
+        assert!(app.login_password.is_empty());
+
+        handle_input(&mut app, make_key(KeyCode::Tab));
+        handle_input(&mut app, make_key(KeyCode::Char('p')));
+        assert_eq!(app.login_username, "u");
+        assert_eq!(app.login_password, "p");
+    }
+
+    #[test]
+    fn login_backspace_removes_from_correct_field() {
+        let mut app = test_app();
+        app.screen = Screen::Login;
+        app.login_username = "user".to_string();
+        app.login_password = "pass".to_string();
+
+        app.login_field = 0;
+        handle_input(&mut app, make_key(KeyCode::Backspace));
+        assert_eq!(app.login_username, "use");
+
+        app.login_field = 1;
+        handle_input(&mut app, make_key(KeyCode::Backspace));
+        assert_eq!(app.login_password, "pas");
+    }
+
+    #[test]
+    fn login_enter_sets_login_requested() {
+        let mut app = test_app();
+        app.screen = Screen::Login;
+        handle_input(&mut app, make_key(KeyCode::Enter));
+        assert_eq!(app.login_status, "login_requested");
+    }
+
+    // ── Worker event handling ───────────────────────────────────────────
+
+    #[test]
+    fn worker_event_note_published_clears_textarea() {
+        let mut app = test_app();
+        app.screen = Screen::Notes;
+        handle_input(&mut app, make_key(KeyCode::Char('x')));
+
+        app.handle_worker_event(WorkerEvent::NotePublished(Ok("note123".to_string())));
+        assert!(app.status.contains("note123"));
+        assert!(app.textarea.lines().join("").is_empty());
+    }
+
+    #[test]
+    fn worker_event_note_error() {
+        let mut app = test_app();
+        app.handle_worker_event(WorkerEvent::NotePublished(Err(anyhow::anyhow!("boom"))));
+        assert!(app.status.contains("boom"));
+    }
+
+    #[test]
+    fn worker_event_threads_fetched() {
+        let mut app = test_app();
+        app.screen = Screen::DMList;
+        let threads = vec![
+            DirectThread { thread_id: "1".into(), thread_title: "A".into(), usernames: vec![], last_message: String::new() },
+            DirectThread { thread_id: "2".into(), thread_title: "B".into(), usernames: vec![], last_message: String::new() },
+        ];
+        app.handle_worker_event(WorkerEvent::ThreadsFetched(Ok(threads)));
+        assert_eq!(app.threads.len(), 2);
+        assert!(app.status.contains("2 conversations"));
+    }
+
+    #[test]
+    fn worker_event_messages_fetched() {
+        let mut app = test_app();
+        let msgs = vec![DirectMessage {
+            user_id: "alice".into(), text: "hi".into(), timestamp: String::new(), is_sender: false,
+        }];
+        app.handle_worker_event(WorkerEvent::MessagesFetched(Ok((msgs, "Alice".into()))));
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.current_thread_title, "Alice");
+    }
+
+    #[test]
+    fn worker_event_dm_sent_ok() {
+        let mut app = test_app();
+        app.current_thread_title = "Alice".into();
+        app.dm_input = "old".into();
+        app.handle_worker_event(WorkerEvent::DMSent(Ok(())));
+        assert!(app.dm_input.is_empty());
+        assert!(app.status.contains("sent!"));
+    }
+
+    #[test]
+    fn worker_event_dm_sent_error() {
+        let mut app = test_app();
+        app.handle_worker_event(WorkerEvent::DMSent(Err(anyhow::anyhow!("network"))));
+        assert!(app.status.contains("network"));
+    }
+
+    #[test]
+    fn app_stores_username() {
+        let app = test_app();
+        assert_eq!(app.username, "testuser");
     }
 }

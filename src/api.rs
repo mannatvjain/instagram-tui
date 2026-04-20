@@ -194,7 +194,31 @@ impl InstagramClient {
             .context("failed to fetch DM inbox")?;
 
         let body: Value = resp.json().context("failed to parse inbox response")?;
+        Ok(Self::parse_threads_response(&body))
+    }
 
+    pub fn get_thread_messages(
+        &self,
+        session: &SessionConfig,
+        thread_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<DirectMessage>, String)> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}/direct_v2/threads/{}/?limit={}",
+                IG_BASE, thread_id, limit
+            ))
+            .headers(self.headers(session))
+            .send()
+            .context("failed to fetch thread messages")?;
+
+        let body: Value = resp.json().context("failed to parse thread response")?;
+        let my_user_id = session.user_id.as_deref().unwrap_or("");
+        Ok(Self::parse_messages_response(&body, my_user_id))
+    }
+
+    pub fn parse_threads_response(body: &Value) -> Vec<DirectThread> {
         let threads = body
             .pointer("/inbox/threads")
             .and_then(|v| v.as_array())
@@ -234,9 +258,7 @@ impl InstagramClient {
                 .and_then(|item| {
                     item.get("text")
                         .and_then(|v| v.as_str())
-                        .or_else(|| {
-                            item.get("item_type").and_then(|v| v.as_str())
-                        })
+                        .or_else(|| item.get("item_type").and_then(|v| v.as_str()))
                 })
                 .unwrap_or("[media]")
                 .to_string();
@@ -255,28 +277,10 @@ impl InstagramClient {
             });
         }
 
-        Ok(result)
+        result
     }
 
-    pub fn get_thread_messages(
-        &self,
-        session: &SessionConfig,
-        thread_id: &str,
-        limit: usize,
-    ) -> Result<(Vec<DirectMessage>, String)> {
-        let resp = self
-            .http
-            .get(format!(
-                "{}/direct_v2/threads/{}/?limit={}",
-                IG_BASE, thread_id, limit
-            ))
-            .headers(self.headers(session))
-            .send()
-            .context("failed to fetch thread messages")?;
-
-        let body: Value = resp.json().context("failed to parse thread response")?;
-
-        let my_user_id = session.user_id.as_deref().unwrap_or("");
+    pub fn parse_messages_response(body: &Value, my_user_id: &str) -> (Vec<DirectMessage>, String) {
         let thread_title = body
             .pointer("/thread/thread_title")
             .and_then(|v| v.as_str())
@@ -289,7 +293,6 @@ impl InstagramClient {
             .cloned()
             .unwrap_or_default();
 
-        // Build username lookup from thread users
         let users = body
             .pointer("/thread/users")
             .and_then(|v| v.as_array())
@@ -348,7 +351,7 @@ impl InstagramClient {
             });
         }
 
-        Ok((messages, thread_title))
+        (messages, thread_title)
     }
 
     pub fn send_dm(&self, session: &SessionConfig, thread_id: &str, text: &str) -> Result<()> {
@@ -374,5 +377,282 @@ impl InstagramClient {
                 .unwrap_or("failed to send message");
             bail!("{}", msg)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn test_session() -> SessionConfig {
+        SessionConfig {
+            username: Some("testuser".to_string()),
+            session_id: Some("sid123".to_string()),
+            csrf_token: Some("csrf456".to_string()),
+            user_id: Some("12345".to_string()),
+            cookies: Some("sessionid=sid123; csrftoken=csrf456".to_string()),
+        }
+    }
+
+    // ── Header tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn headers_include_csrf_token() {
+        let client = InstagramClient::new().unwrap();
+        let session = test_session();
+        let headers = client.headers(&session);
+        assert_eq!(headers.get("X-CSRFToken").unwrap(), "csrf456");
+    }
+
+    #[test]
+    fn headers_include_cookies() {
+        let client = InstagramClient::new().unwrap();
+        let session = test_session();
+        let headers = client.headers(&session);
+        assert!(headers.get("Cookie").unwrap().to_str().unwrap().contains("sessionid=sid123"));
+    }
+
+    #[test]
+    fn headers_without_csrf_omit_it() {
+        let client = InstagramClient::new().unwrap();
+        let session = SessionConfig::default();
+        let headers = client.headers(&session);
+        assert!(headers.get("X-CSRFToken").is_none());
+    }
+
+    #[test]
+    fn headers_always_include_app_id() {
+        let client = InstagramClient::new().unwrap();
+        let session = SessionConfig::default();
+        let headers = client.headers(&session);
+        assert_eq!(headers.get("X-IG-App-ID").unwrap(), "936619743392459");
+    }
+
+    // ── Note validation tests ───────────────────────────────────────────
+
+    #[test]
+    fn create_note_rejects_empty() {
+        let client = InstagramClient::new().unwrap();
+        let session = test_session();
+        let result = client.create_note(&session, "");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn create_note_rejects_too_long() {
+        let client = InstagramClient::new().unwrap();
+        let session = test_session();
+        let long_text = "a".repeat(61);
+        let result = client.create_note(&session, &long_text);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("61/60"));
+    }
+
+    #[test]
+    fn create_note_accepts_60_chars() {
+        let client = InstagramClient::new().unwrap();
+        let session = test_session();
+        let text = "a".repeat(60);
+        // This will fail with a network error (no real server), but it
+        // should NOT fail validation
+        let result = client.create_note(&session, &text);
+        // The error should be a network error, not a validation error
+        if let Err(e) = result {
+            let msg = e.to_string();
+            assert!(!msg.contains("empty"));
+            assert!(!msg.contains("too long"));
+        }
+    }
+
+    // ── Thread parsing tests ────────────────────────────────────────────
+
+    #[test]
+    fn parse_threads_empty_inbox() {
+        let body = json!({"inbox": {"threads": []}});
+        let threads = InstagramClient::parse_threads_response(&body);
+        assert!(threads.is_empty());
+    }
+
+    #[test]
+    fn parse_threads_missing_inbox() {
+        let body = json!({});
+        let threads = InstagramClient::parse_threads_response(&body);
+        assert!(threads.is_empty());
+    }
+
+    #[test]
+    fn parse_threads_basic() {
+        let body = json!({
+            "inbox": {
+                "threads": [
+                    {
+                        "thread_id": "thread_001",
+                        "thread_title": "Alice",
+                        "users": [{"username": "alice"}],
+                        "items": [{"text": "hey there"}]
+                    }
+                ]
+            }
+        });
+        let threads = InstagramClient::parse_threads_response(&body);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].thread_id, "thread_001");
+        assert_eq!(threads[0].thread_title, "Alice");
+        assert_eq!(threads[0].usernames, vec!["alice"]);
+        assert_eq!(threads[0].last_message, "hey there");
+    }
+
+    #[test]
+    fn parse_threads_empty_title_falls_back_to_usernames() {
+        let body = json!({
+            "inbox": {
+                "threads": [
+                    {
+                        "thread_id": "t1",
+                        "thread_title": "",
+                        "users": [{"username": "bob"}, {"username": "carol"}],
+                        "items": [{"text": "hello"}]
+                    }
+                ]
+            }
+        });
+        let threads = InstagramClient::parse_threads_response(&body);
+        assert_eq!(threads[0].thread_title, "bob, carol");
+    }
+
+    #[test]
+    fn parse_threads_media_item_falls_back_to_type() {
+        let body = json!({
+            "inbox": {
+                "threads": [
+                    {
+                        "thread_id": "t1",
+                        "thread_title": "Alice",
+                        "users": [{"username": "alice"}],
+                        "items": [{"item_type": "reel_share"}]
+                    }
+                ]
+            }
+        });
+        let threads = InstagramClient::parse_threads_response(&body);
+        assert_eq!(threads[0].last_message, "reel_share");
+    }
+
+    #[test]
+    fn parse_threads_no_items_shows_media() {
+        let body = json!({
+            "inbox": {
+                "threads": [
+                    {
+                        "thread_id": "t1",
+                        "thread_title": "Alice",
+                        "users": [],
+                        "items": []
+                    }
+                ]
+            }
+        });
+        let threads = InstagramClient::parse_threads_response(&body);
+        assert_eq!(threads[0].last_message, "[media]");
+    }
+
+    #[test]
+    fn parse_threads_multiple() {
+        let body = json!({
+            "inbox": {
+                "threads": [
+                    {
+                        "thread_id": "t1",
+                        "thread_title": "Alice",
+                        "users": [{"username": "alice"}],
+                        "items": [{"text": "hi"}]
+                    },
+                    {
+                        "thread_id": "t2",
+                        "thread_title": "Bob",
+                        "users": [{"username": "bob"}],
+                        "items": [{"text": "yo"}]
+                    }
+                ]
+            }
+        });
+        let threads = InstagramClient::parse_threads_response(&body);
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].thread_id, "t1");
+        assert_eq!(threads[1].thread_id, "t2");
+    }
+
+    // ── Message parsing tests ───────────────────────────────────────────
+
+    #[test]
+    fn parse_messages_empty_thread() {
+        let body = json!({"thread": {"thread_title": "Alice", "items": [], "users": []}});
+        let (msgs, title) = InstagramClient::parse_messages_response(&body, "999");
+        assert!(msgs.is_empty());
+        assert_eq!(title, "Alice");
+    }
+
+    #[test]
+    fn parse_messages_identifies_sender() {
+        let body = json!({
+            "thread": {
+                "thread_title": "Alice",
+                "users": [{"pk": 111, "username": "alice"}],
+                "items": [
+                    {"user_id": 999, "text": "from me"},
+                    {"user_id": 111, "text": "from alice"}
+                ]
+            }
+        });
+        let (msgs, _) = InstagramClient::parse_messages_response(&body, "999");
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0].is_sender);
+        assert_eq!(msgs[0].text, "from me");
+        assert!(!msgs[1].is_sender);
+        assert_eq!(msgs[1].text, "from alice");
+        assert_eq!(msgs[1].user_id, "alice");
+    }
+
+    #[test]
+    fn parse_messages_media_fallback() {
+        let body = json!({
+            "thread": {
+                "thread_title": "Test",
+                "users": [],
+                "items": [
+                    {"user_id": 1, "item_type": "reel_share"},
+                    {"user_id": 1, "item_type": "media_share"},
+                    {"user_id": 1}
+                ]
+            }
+        });
+        let (msgs, _) = InstagramClient::parse_messages_response(&body, "999");
+        assert_eq!(msgs[0].text, "[reel_share]");
+        assert_eq!(msgs[1].text, "[media_share]");
+        assert_eq!(msgs[2].text, "[media]");
+    }
+
+    #[test]
+    fn parse_messages_unknown_user_shows_them() {
+        let body = json!({
+            "thread": {
+                "thread_title": "Test",
+                "users": [],
+                "items": [{"user_id": 777, "text": "mystery"}]
+            }
+        });
+        let (msgs, _) = InstagramClient::parse_messages_response(&body, "999");
+        assert_eq!(msgs[0].user_id, "them");
+        assert!(!msgs[0].is_sender);
+    }
+
+    #[test]
+    fn parse_messages_missing_thread() {
+        let body = json!({});
+        let (msgs, title) = InstagramClient::parse_messages_response(&body, "999");
+        assert!(msgs.is_empty());
+        assert_eq!(title, "");
     }
 }
