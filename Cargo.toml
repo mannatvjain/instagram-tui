@@ -1,0 +1,25 @@
+[package]
+name = "instagram-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Write-only Instagram TUI — notes and DMs from the terminal"
+
+[[bin]]
+name = "inote"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+directories = "6.0"
+ratatui = "0.29"
+reqwest = { version = "0.12", features = ["blocking", "json", "cookies", "rustls-tls"], default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tui-textarea = "0.7"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.9"
