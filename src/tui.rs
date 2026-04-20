@@ -546,6 +546,9 @@ fn handle_notes_input(app: &mut App, key: event::KeyEvent) -> bool {
             } else {
                 app.status = "publishing...".to_string();
                 let _ = app.cmd_tx.send(WorkerCommand::PublishNote(text));
+                // Clear immediately so you can keep working
+                app.textarea.select_all();
+                app.textarea.cut();
             }
         }
         (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
