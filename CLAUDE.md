@@ -31,6 +31,8 @@ This is a write-only Instagram client — no feed browsing. Two capabilities:
 ## Conventions
 - Screens use `@work(thread=True)` for all API calls to avoid blocking the UI
 - Each screen manages its own `#status-line` Static widget for feedback
+- Session restore is local-only (no validation API call) — makes startup instant
+- If a session is stale, API calls raise `LoginRequired` → `handle_login_required()` pushes the login screen inline (no restart needed)
 - Session is persisted after every API call that mutates state (login, note, DM)
 - Config files are `chmod 0o600`
 

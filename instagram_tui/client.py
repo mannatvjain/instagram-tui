@@ -19,8 +19,6 @@ class InstagramClient:
         try:
             self.cl.set_settings(session)
             self.cl.login_by_sessionid(session.get("authorization_data", {}).get("sessionid", ""))
-            # Validate session with a lightweight call
-            self.cl.get_timeline_feed()
             self._logged_in = True
             return True
         except Exception:
@@ -62,5 +60,5 @@ class InstagramClient:
         return self.cl.direct_messages(thread_id, amount=amount)
 
     def send_dm(self, thread_id: str, text: str) -> None:
-        self.cl.direct_answer(thread_id, text)
+        self.cl.direct_send(text, thread_ids=[int(thread_id)])
         self.config.save_session(self.cl.get_settings())
