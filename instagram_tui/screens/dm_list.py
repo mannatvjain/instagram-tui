@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from instagrapi.exceptions import LoginRequired
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -16,6 +17,7 @@ class DMListScreen(Screen):
     CSS = """
     #dm-listview {
         height: 1fr;
+        margin: 1 2;
     }
     .thread-item {
         padding: 0 1;
@@ -28,11 +30,14 @@ class DMListScreen(Screen):
         color: $text-muted;
     }
     #status-line {
-        dock: bottom;
         height: 1;
-        padding: 0 1;
-        background: $accent;
-        color: $text;
+        padding: 0 2;
+        margin: 0 0 1 0;
+        color: $text-muted;
+    }
+    Footer {
+        height: 3;
+        padding: 1 1;
     }
     """
 
@@ -46,7 +51,15 @@ class DMListScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self._load_threads()
+        cached = getattr(self.app, "_cached_threads", None)
+        if cached is not None:
+            self._threads = cached
+            self.app._cached_threads = None
+            self._populate_list()
+            count = len(self._threads)
+            self._set_status(f"{count} conversation{'s' if count != 1 else ''}")
+        else:
+            self._load_threads()
 
     def action_go_back(self) -> None:
         self.app.pop_screen()
@@ -62,7 +75,9 @@ class DMListScreen(Screen):
             self._threads = client.get_direct_threads(amount=20)
             self.app.call_from_thread(self._populate_list)
             count = len(self._threads)
-            self._set_status(f"{count} conversation{'s' if count != 1 else ''}  [R] refresh | Esc back")
+            self._set_status(f"{count} conversation{'s' if count != 1 else ''}")
+        except LoginRequired:
+            self.app.call_from_thread(self.app.handle_login_required)
         except Exception as e:
             self._set_status(f"error: {e}")
 

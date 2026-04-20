@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from instagrapi.exceptions import LoginRequired
 from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -19,27 +20,30 @@ class NotesScreen(Screen):
     CSS = """
     #note-textarea {
         height: 1fr;
+        margin: 1 2;
     }
     #meta-line {
-        dock: bottom;
         height: 1;
-        padding: 0 1;
+        padding: 0 2;
+        color: $text-muted;
     }
     #status-line {
-        dock: bottom;
         height: 1;
-        padding: 0 1;
-        background: $accent;
-        color: $text;
+        padding: 0 2;
+        margin: 0 0 1 0;
+        color: $text-muted;
     }
-    .green { color: green; }
-    .yellow { color: yellow; }
-    .red { color: red; }
+    Footer {
+        height: 3;
+        padding: 1 1;
+    }
+    .warning { color: $warning; }
+    .error { color: $error; }
     """
 
     def compose(self) -> ComposeResult:
         yield TextArea(id="note-textarea")
-        yield Static("0 chars  60 left  Ctrl-S publish | Ctrl-L clear | Esc back", id="meta-line", classes="green")
+        yield Static("0 chars  60 left", id="meta-line")
         yield Static("", id="status-line")
         yield Footer()
 
@@ -54,19 +58,18 @@ class NotesScreen(Screen):
         remaining = NOTE_CHAR_LIMIT - count
 
         meta = self.query_one("#meta-line", Static)
-        meta.remove_class("green", "yellow", "red")
+        meta.remove_class("warning", "error")
 
         if remaining < 0:
-            meta.add_class("red")
+            meta.add_class("error")
             left_str = f"{abs(remaining)} over"
         elif remaining < 10:
-            meta.add_class("yellow")
+            meta.add_class("warning")
             left_str = f"{remaining} left"
         else:
-            meta.add_class("green")
             left_str = f"{remaining} left"
 
-        meta.update(f"{count} chars  {left_str}  Ctrl-S publish | Ctrl-L clear | Esc back")
+        meta.update(f"{count} chars  {left_str}")
 
     def action_go_back(self) -> None:
         self.app.pop_screen()
@@ -97,6 +100,8 @@ class NotesScreen(Screen):
             self.app.call_from_thread(
                 lambda: setattr(self.query_one("#note-textarea", TextArea), "text", "")
             )
+        except LoginRequired:
+            self.app.call_from_thread(self.app.handle_login_required)
         except Exception as e:
             self._set_status(f"error: {e}")
 

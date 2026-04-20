@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from textual import work
+import threading
+
+from instagrapi.exceptions import LoginRequired
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Footer, Static
@@ -22,11 +24,9 @@ class InstagramTUI(App):
         background: $surface;
     }
     #status-line {
-        dock: bottom;
         height: 1;
-        background: $accent;
-        color: $text;
-        padding: 0 1;
+        padding: 0 2;
+        color: $text-muted;
     }
     #welcome {
         margin: 2 2;
@@ -34,6 +34,10 @@ class InstagramTUI(App):
     #keyhints {
         margin: 0 2;
         color: $text-muted;
+    }
+    Footer {
+        height: 3;
+        padding: 1 1;
     }
     """
 
@@ -49,20 +53,33 @@ class InstagramTUI(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        from instagram_tui.screens.notes import NotesScreen
+        self.install_screen(NotesScreen(), name="notes")
+
         if self._config.has_session():
             self._try_restore()
         else:
             self._show_login()
 
-    @work(thread=True)
     def _try_restore(self) -> None:
-        self._set_status("restoring session...")
         ok = self.ig_client.restore_session()
         if ok:
             username = self.ig_client.get_username()
             self._set_status(f"@{username}")
+            self._prefetch_dms()
         else:
-            self.app.call_from_thread(self._show_login)
+            self._show_login()
+
+    def _prefetch_dms(self) -> None:
+        def _fetch() -> None:
+            try:
+                self._cached_threads = self.ig_client.get_direct_threads(amount=20)
+            except LoginRequired:
+                self.call_from_thread(self.handle_login_required)
+            except Exception:
+                pass
+        self._cached_threads = None
+        threading.Thread(target=_fetch, daemon=True).start()
 
     def _show_login(self) -> None:
         from instagram_tui.screens.login import LoginScreen
@@ -72,13 +89,18 @@ class InstagramTUI(App):
         self.pop_screen()
         username = self.ig_client.get_username()
         self._set_status(f"@{username}")
+        self._prefetch_dms()
+
+    def handle_login_required(self) -> None:
+        self.ig_client._logged_in = False
+        self._set_status("session expired")
+        self._show_login()
 
     def action_open_notes(self) -> None:
         if not self.ig_client.logged_in:
             self._set_status("not logged in")
             return
-        from instagram_tui.screens.notes import NotesScreen
-        self.push_screen(NotesScreen())
+        self.push_screen("notes")
 
     def action_open_dms(self) -> None:
         if not self.ig_client.logged_in:

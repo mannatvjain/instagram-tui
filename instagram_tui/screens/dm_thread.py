@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from instagrapi.exceptions import LoginRequired
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -45,6 +46,7 @@ class DMThreadScreen(Screen):
     CSS = """
     #messages-scroll {
         height: 1fr;
+        margin: 1 2;
         padding: 0 1;
     }
     .msg-sent {
@@ -65,15 +67,16 @@ class DMThreadScreen(Screen):
         color: $text-muted;
     }
     #reply-input {
-        dock: bottom;
-        margin: 0 1;
+        margin: 0 2 1 2;
     }
     #status-line {
-        dock: bottom;
         height: 1;
-        padding: 0 1;
-        background: $accent;
-        color: $text;
+        padding: 0 2;
+        color: $text-muted;
+    }
+    Footer {
+        height: 3;
+        padding: 1 1;
     }
     """
 
@@ -87,16 +90,15 @@ class DMThreadScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="messages-scroll")
-        yield Static(f"{self._title}", id="status-line")
         yield Input(placeholder="reply...", id="reply-input")
+        yield Static(self._title, id="status-line")
         yield Footer()
 
     def on_mount(self) -> None:
-        # Show thread's cached messages immediately
         if self._thread.messages:
             self._render_messages(self._thread.messages)
             self._set_status(
-                f"{self._title}  {len(self._thread.messages)} msgs (cached)  [R] load fresh | [O] older | Esc back"
+                f"{self._title}  {len(self._thread.messages)} msgs (cached)"
             )
         else:
             self._load_messages()
@@ -126,10 +128,12 @@ class DMThreadScreen(Screen):
             messages = client.get_thread_messages(self._thread_id, amount=self._loaded_amount)
             self.app.call_from_thread(self._render_messages, messages, keep_scroll_top)
             self._set_status(
-                f"{self._title}  {len(messages)} msgs  [O] older | [R] refresh | Esc back"
+                f"{self._title}  {len(messages)} msgs"
             )
+        except LoginRequired:
+            self.app.call_from_thread(self.app.handle_login_required)
+            return
         except Exception as e:
-            # If API call fails, fall back to thread's cached messages
             if self._thread.messages:
                 self.app.call_from_thread(self._render_messages, self._thread.messages)
                 self._set_status(f"{self._title}  showing cached msgs  error: {e}")
@@ -171,6 +175,8 @@ class DMThreadScreen(Screen):
             self._set_status(f"{self._title}  sent!")
             self._loaded_amount = MESSAGES_PER_PAGE
             self._load_messages()
+        except LoginRequired:
+            self.app.call_from_thread(self.app.handle_login_required)
         except Exception as e:
             self._set_status(f"error: {e}")
 
