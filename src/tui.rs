@@ -202,13 +202,14 @@ impl<'a> App<'a> {
                     .map(|t| (t.thread_id.clone(), t.last_message.clone()))
                     .collect();
                 for t in &new_threads {
-                    if let Some(old_msg) = old_msgs.get(&t.thread_id) {
-                        if *old_msg != t.last_message {
-                            self.unread.insert(t.thread_id.clone());
-                        }
-                    } else {
-                        // New thread we haven't seen
+                    let changed = match old_msgs.get(&t.thread_id) {
+                        Some(old_msg) => *old_msg != t.last_message,
+                        None => true, // new thread
+                    };
+                    if changed {
                         self.unread.insert(t.thread_id.clone());
+                        // Prefetch the updated messages so cache is fresh
+                        let _ = self.cmd_tx.send(WorkerCommand::FetchMessages(t.thread_id.clone()));
                     }
                 }
                 self.threads = new_threads;
