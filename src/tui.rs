@@ -620,28 +620,29 @@ fn handle_dm_list_input(app: &mut App, key: event::KeyEvent) -> bool {
                     let tid = thread.thread_id.clone();
                     app.current_thread_title = thread.thread_title.clone();
                     app.current_thread_id = tid.clone();
-                    app.unread.remove(&tid);
                     app.dm_input.clear();
                     app.dm_scroll = 0;
                     app.screen = Screen::DMThread(tid.clone());
 
-                    // Show cached messages, only refetch if stale (>30s)
-                    let cache_ttl = std::time::Duration::from_secs(30);
+                    // Show cached messages immediately if available
+                    let was_unread = app.unread.remove(&tid);
                     if let Some((cached, fetched_at)) = app.message_cache.get(&tid) {
                         app.messages = cached.clone();
-                        if fetched_at.elapsed() < cache_ttl {
-                            app.status = format!(
-                                "{}  {} msgs",
-                                thread.thread_title,
-                                cached.len()
-                            );
-                        } else {
+                        let stale = fetched_at.elapsed() > std::time::Duration::from_secs(30);
+                        if was_unread || stale {
+                            // Unread or stale — show cache but refresh in background
                             app.status = format!(
                                 "{}  {} msgs (refreshing...)",
                                 thread.thread_title,
                                 cached.len()
                             );
                             let _ = app.cmd_tx.send(WorkerCommand::FetchMessages(tid));
+                        } else {
+                            app.status = format!(
+                                "{}  {} msgs",
+                                thread.thread_title,
+                                cached.len()
+                            );
                         }
                     } else {
                         app.messages.clear();
