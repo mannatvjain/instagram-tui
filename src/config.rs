@@ -27,6 +27,7 @@ impl ConfigStore {
         Ok(Self { config_dir })
     }
 
+    #[cfg(test)]
     pub fn from_path(config_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&config_dir)
             .with_context(|| format!("failed to create config dir: {}", config_dir.display()))?;
@@ -46,6 +47,7 @@ impl ConfigStore {
         serde_json::from_str(&data).ok()
     }
 
+    #[cfg(test)]
     pub fn save_session(&self, session: &SessionConfig) -> Result<()> {
         let path = self.session_path();
         let data = serde_json::to_string_pretty(session)?;

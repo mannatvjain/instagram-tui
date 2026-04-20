@@ -68,17 +68,10 @@ impl InstagramClient {
         if candidate.exists() {
             return Ok(candidate);
         }
-        // Check home directory project
-        if let Some(home) = dirs_home() {
-            let candidate = home.join("Developer/instagram-tui/bridge.py");
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-        }
         bail!("bridge.py not found — run from the instagram-tui project directory")
     }
 
-    fn find_python(bridge_path: &PathBuf) -> Result<PathBuf> {
+    fn find_python(bridge_path: &std::path::Path) -> Result<PathBuf> {
         // Look for .venv/bin/python3 relative to bridge.py
         let project_dir = bridge_path.parent().unwrap_or(std::path::Path::new("."));
         let venv_python = project_dir.join(".venv/bin/python3");
@@ -115,16 +108,6 @@ impl InstagramClient {
         }
     }
 
-    pub fn login(&mut self, username: &str, password: &str) -> Result<(String, String)> {
-        let resp = self.call("login", json!({
-            "username": username,
-            "password": password,
-        }))?;
-        let user = resp.get("username").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let uid = resp.get("user_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        Ok((user, uid))
-    }
-
     pub fn get_direct_threads(&mut self, limit: usize) -> Result<Vec<DirectThread>> {
         let resp = self.call("threads", json!({"amount": limit}))?;
         let threads: Vec<DirectThread> = serde_json::from_value(
@@ -159,9 +142,12 @@ impl InstagramClient {
         Ok(note_id)
     }
 
-    // ── Parsing helpers (kept for tests) ────────────────────────────────
+}
 
-    pub fn parse_threads_response(body: &Value) -> Vec<DirectThread> {
+// ── Parsing helpers (test-only) ─────────────────────────────────────────
+
+#[cfg(test)]
+fn parse_threads_response(body: &Value) -> Vec<DirectThread> {
         let threads = body
             .pointer("/inbox/threads")
             .and_then(|v| v.as_array())
@@ -183,7 +169,8 @@ impl InstagramClient {
         }).collect()
     }
 
-    pub fn parse_messages_response(body: &Value, my_user_id: &str) -> (Vec<DirectMessage>, String) {
+#[cfg(test)]
+fn parse_messages_response(body: &Value, my_user_id: &str) -> (Vec<DirectMessage>, String) {
         let thread_title = body.pointer("/thread/thread_title").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let items = body.pointer("/thread/items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
         let users = body.pointer("/thread/users").and_then(|v| v.as_array()).cloned().unwrap_or_default();
@@ -207,7 +194,6 @@ impl InstagramClient {
         }).collect();
 
         (messages, thread_title)
-    }
 }
 
 impl Drop for InstagramClient {
@@ -216,28 +202,21 @@ impl Drop for InstagramClient {
     }
 }
 
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
-
-    // ── Note validation (now done in bridge, but test parse helpers) ────
 
     #[test]
     fn parse_threads_empty_inbox() {
         let body = json!({"inbox": {"threads": []}});
-        let threads = InstagramClient::parse_threads_response(&body);
+        let threads = super::parse_threads_response(&body);
         assert!(threads.is_empty());
     }
 
     #[test]
     fn parse_threads_missing_inbox() {
         let body = json!({});
-        let threads = InstagramClient::parse_threads_response(&body);
+        let threads = super::parse_threads_response(&body);
         assert!(threads.is_empty());
     }
 
@@ -253,7 +232,7 @@ mod tests {
                 }]
             }
         });
-        let threads = InstagramClient::parse_threads_response(&body);
+        let threads = super::parse_threads_response(&body);
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].thread_id, "thread_001");
         assert_eq!(threads[0].thread_title, "Alice");
@@ -266,7 +245,7 @@ mod tests {
         let body = json!({
             "inbox": {"threads": [{"thread_id": "t1", "thread_title": "", "users": [{"username": "bob"}, {"username": "carol"}], "items": [{"text": "hello"}]}]}
         });
-        let threads = InstagramClient::parse_threads_response(&body);
+        let threads = super::parse_threads_response(&body);
         assert_eq!(threads[0].thread_title, "bob, carol");
     }
 
@@ -275,7 +254,7 @@ mod tests {
         let body = json!({
             "inbox": {"threads": [{"thread_id": "t1", "thread_title": "Alice", "users": [{"username": "alice"}], "items": [{"item_type": "reel_share"}]}]}
         });
-        let threads = InstagramClient::parse_threads_response(&body);
+        let threads = super::parse_threads_response(&body);
         assert_eq!(threads[0].last_message, "reel_share");
     }
 
@@ -284,7 +263,7 @@ mod tests {
         let body = json!({
             "inbox": {"threads": [{"thread_id": "t1", "thread_title": "Alice", "users": [], "items": []}]}
         });
-        let threads = InstagramClient::parse_threads_response(&body);
+        let threads = super::parse_threads_response(&body);
         assert_eq!(threads[0].last_message, "[media]");
     }
 
@@ -296,14 +275,14 @@ mod tests {
                 {"thread_id": "t2", "thread_title": "Bob", "users": [{"username": "bob"}], "items": [{"text": "yo"}]}
             ]}
         });
-        let threads = InstagramClient::parse_threads_response(&body);
+        let threads = super::parse_threads_response(&body);
         assert_eq!(threads.len(), 2);
     }
 
     #[test]
     fn parse_messages_empty_thread() {
         let body = json!({"thread": {"thread_title": "Alice", "items": [], "users": []}});
-        let (msgs, title) = InstagramClient::parse_messages_response(&body, "999");
+        let (msgs, title) = super::parse_messages_response(&body, "999");
         assert!(msgs.is_empty());
         assert_eq!(title, "Alice");
     }
@@ -320,7 +299,7 @@ mod tests {
                 ]
             }
         });
-        let (msgs, _) = InstagramClient::parse_messages_response(&body, "999");
+        let (msgs, _) = super::parse_messages_response(&body, "999");
         assert_eq!(msgs.len(), 2);
         assert!(msgs[0].is_sender);
         assert!(!msgs[1].is_sender);
@@ -335,7 +314,7 @@ mod tests {
                 {"user_id": 1},
             ]}
         });
-        let (msgs, _) = InstagramClient::parse_messages_response(&body, "999");
+        let (msgs, _) = super::parse_messages_response(&body, "999");
         assert_eq!(msgs[0].text, "[reel_share]");
         assert_eq!(msgs[1].text, "[media]");
     }
@@ -343,14 +322,14 @@ mod tests {
     #[test]
     fn parse_messages_unknown_user_shows_them() {
         let body = json!({"thread": {"thread_title": "Test", "users": [], "items": [{"user_id": 777, "text": "mystery"}]}});
-        let (msgs, _) = InstagramClient::parse_messages_response(&body, "999");
+        let (msgs, _) = super::parse_messages_response(&body, "999");
         assert_eq!(msgs[0].user_id, "them");
     }
 
     #[test]
     fn parse_messages_missing_thread() {
         let body = json!({});
-        let (msgs, title) = InstagramClient::parse_messages_response(&body, "999");
+        let (msgs, title) = super::parse_messages_response(&body, "999");
         assert!(msgs.is_empty());
         assert_eq!(title, "");
     }

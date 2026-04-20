@@ -16,18 +16,16 @@ use crate::config::{ConfigStore, DmCache};
 
 pub enum WorkerCommand {
     PublishNote(String),
-    FetchThreads,
+    FetchThreads { poll: bool },
     FetchMessages(String), // thread_id
     SendDM(String, String), // thread_id, text
-    PollThreads,            // background poll — same as FetchThreads but tagged differently
 }
 
 pub enum WorkerEvent {
     NotePublished(Result<String>),
-    ThreadsFetched(Result<Vec<DirectThread>>),
+    ThreadsFetched { poll: bool, result: Result<Vec<DirectThread>> },
     MessagesFetched(String, Result<(Vec<DirectMessage>, String)>), // thread_id, result
     DMSent(Result<()>),
-    PollResult(Result<Vec<DirectThread>>),
 }
 
 fn worker_loop(
@@ -42,17 +40,13 @@ fn worker_loop(
                 let result = api.create_note(&text);
                 let _ = evt_tx.send(WorkerEvent::NotePublished(result));
             }
-            WorkerCommand::FetchThreads => {
+            WorkerCommand::FetchThreads { poll } => {
                 let result = api.get_direct_threads(20);
-                let _ = evt_tx.send(WorkerEvent::ThreadsFetched(result));
+                let _ = evt_tx.send(WorkerEvent::ThreadsFetched { poll, result });
             }
             WorkerCommand::FetchMessages(thread_id) => {
                 let result = api.get_thread_messages(&thread_id, 20);
                 let _ = evt_tx.send(WorkerEvent::MessagesFetched(thread_id, result));
-            }
-            WorkerCommand::PollThreads => {
-                let result = api.get_direct_threads(20);
-                let _ = evt_tx.send(WorkerEvent::PollResult(result));
             }
             WorkerCommand::SendDM(thread_id, text) => {
                 let result = api.send_dm(&thread_id, &text);
@@ -76,6 +70,7 @@ enum Screen {
     Notes,
     DMList,
     DMThread(String), // thread_id
+    #[allow(dead_code)]
     Login,
 }
 
@@ -121,9 +116,6 @@ impl<'a> App<'a> {
         textarea.set_block(Block::default().borders(Borders::ALL).title(" Compose "));
         textarea.set_placeholder_text("Write a note (60 char max). Ctrl-S publishes. Esc goes back.");
 
-        // Prefetch DMs
-        let _ = cmd_tx.send(WorkerCommand::FetchThreads);
-
         Self {
             screen: Screen::Home,
             username,
@@ -160,24 +152,40 @@ impl<'a> App<'a> {
             WorkerEvent::NotePublished(Err(e)) => {
                 self.status = format!("error: {}", e);
             }
-            WorkerEvent::ThreadsFetched(Ok(threads)) => {
-                self.threads = threads;
+            WorkerEvent::ThreadsFetched { poll, result: Ok(new_threads) } => {
+                if poll {
+                    // Diff against old threads to detect new messages
+                    let old_msgs: std::collections::HashMap<&str, &str> = self
+                        .threads
+                        .iter()
+                        .map(|t| (t.thread_id.as_str(), t.last_message.as_str()))
+                        .collect();
+                    for t in &new_threads {
+                        let changed = old_msgs.get(t.thread_id.as_str())
+                            .map_or(true, |old| *old != t.last_message);
+                        if changed {
+                            self.unread.insert(t.thread_id.clone());
+                            let _ = self.cmd_tx.send(WorkerCommand::FetchMessages(t.thread_id.clone()));
+                        }
+                    }
+                } else {
+                    // Initial fetch — prefetch uncached threads
+                    for t in &new_threads {
+                        if !self.message_cache.contains_key(&t.thread_id) {
+                            let _ = self.cmd_tx.send(WorkerCommand::FetchMessages(t.thread_id.clone()));
+                        }
+                    }
+                }
+                self.threads = new_threads;
                 if self.screen == Screen::DMList {
                     self.status = format!("{} conversations", self.threads.len());
                 }
-                // Prefetch messages for all threads that aren't cached
-                for t in &self.threads {
-                    if !self.message_cache.contains_key(&t.thread_id) {
-                        let _ = self.cmd_tx.send(WorkerCommand::FetchMessages(t.thread_id.clone()));
-                    }
-                }
             }
-            WorkerEvent::ThreadsFetched(Err(e)) => {
+            WorkerEvent::ThreadsFetched { result: Err(e), .. } => {
                 self.status = format!("error: {}", e);
             }
             WorkerEvent::MessagesFetched(tid, Ok((msgs, title))) => {
                 self.message_cache.insert(tid.clone(), (msgs.clone(), std::time::Instant::now()));
-                // Only update the visible screen if this is the active thread
                 if tid == self.current_thread_id {
                     self.messages = msgs;
                     if !title.is_empty() {
@@ -194,27 +202,6 @@ impl<'a> App<'a> {
             WorkerEvent::MessagesFetched(_tid, Err(e)) => {
                 self.status = format!("error: {}", e);
             }
-            WorkerEvent::PollResult(Ok(new_threads)) => {
-                // Compare last messages to find new activity
-                let old_msgs: std::collections::HashMap<String, String> = self
-                    .threads
-                    .iter()
-                    .map(|t| (t.thread_id.clone(), t.last_message.clone()))
-                    .collect();
-                for t in &new_threads {
-                    let changed = match old_msgs.get(&t.thread_id) {
-                        Some(old_msg) => *old_msg != t.last_message,
-                        None => true, // new thread
-                    };
-                    if changed {
-                        self.unread.insert(t.thread_id.clone());
-                        // Prefetch the updated messages so cache is fresh
-                        let _ = self.cmd_tx.send(WorkerCommand::FetchMessages(t.thread_id.clone()));
-                    }
-                }
-                self.threads = new_threads;
-            }
-            WorkerEvent::PollResult(Err(_)) => {}
             WorkerEvent::DMSent(Ok(())) => {
                 self.status = format!("{}  sent!", self.current_thread_title);
                 self.dm_input.clear();
@@ -561,7 +548,7 @@ fn handle_home_input(app: &mut App, key: event::KeyEvent) -> bool {
             app.status = format!("{} conversations", app.threads.len());
             if app.threads.is_empty() {
                 app.status = "loading...".to_string();
-                let _ = app.cmd_tx.send(WorkerCommand::FetchThreads);
+                let _ = app.cmd_tx.send(WorkerCommand::FetchThreads { poll: false });
             }
             if !app.threads.is_empty() && app.thread_list_state.selected().is_none() {
                 app.thread_list_state.select(Some(0));
@@ -613,7 +600,7 @@ fn handle_dm_list_input(app: &mut App, key: event::KeyEvent) -> bool {
         }
         KeyCode::Char('r') => {
             app.status = "loading...".to_string();
-            let _ = app.cmd_tx.send(WorkerCommand::FetchThreads);
+            let _ = app.cmd_tx.send(WorkerCommand::FetchThreads { poll: false });
         }
         KeyCode::Up | KeyCode::Char('k') => {
             let i = app.thread_list_state.selected().unwrap_or(0);
@@ -769,7 +756,7 @@ pub fn run(
     }
 
     // Prefetch DMs (will replace stale cache)
-    let _ = app.cmd_tx.send(WorkerCommand::FetchThreads);
+    let _ = app.cmd_tx.send(WorkerCommand::FetchThreads { poll: false });
 
     let save_store = ConfigStore::new().ok();
     std::thread::spawn(move || {
@@ -790,7 +777,7 @@ pub fn run(
 
         // Background poll for new messages
         if last_poll.elapsed() >= poll_interval {
-            let _ = app.cmd_tx.send(WorkerCommand::PollThreads);
+            let _ = app.cmd_tx.send(WorkerCommand::FetchThreads { poll: true });
             last_poll = std::time::Instant::now();
         }
 
@@ -1169,7 +1156,7 @@ mod tests {
             DirectThread { thread_id: "1".into(), thread_title: "A".into(), usernames: vec![], last_message: String::new() },
             DirectThread { thread_id: "2".into(), thread_title: "B".into(), usernames: vec![], last_message: String::new() },
         ];
-        app.handle_worker_event(WorkerEvent::ThreadsFetched(Ok(threads)));
+        app.handle_worker_event(WorkerEvent::ThreadsFetched { poll: false, result: Ok(threads) });
         assert_eq!(app.threads.len(), 2);
         assert!(app.status.contains("2 conversations"));
     }

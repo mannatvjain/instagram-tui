@@ -18,7 +18,6 @@ def init():
 
 
 def load_client() -> Client:
-    init()
     cl = Client()
     if SESSION_FILE.exists():
         data = json.loads(SESSION_FILE.read_text())
@@ -29,7 +28,6 @@ def load_client() -> Client:
 
 
 def save_session(cl: Client):
-    init()
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     SESSION_FILE.write_text(json.dumps(cl.get_settings(), indent=2, default=str))
     SESSION_FILE.chmod(0o600)
@@ -49,7 +47,6 @@ def cmd_login(cl: Client, args: dict) -> dict:
 def cmd_threads(cl: Client, args: dict) -> dict:
     amount = args.get("amount", 20)
     threads = cl.direct_threads(amount=amount)
-    save_session(cl)
     result = []
     for t in threads:
         users = [u.username for u in t.users]
@@ -69,15 +66,13 @@ def cmd_threads(cl: Client, args: dict) -> dict:
 def cmd_messages(cl: Client, args: dict) -> dict:
     thread_id = args["thread_id"]
     amount = args.get("amount", 20)
-    messages = cl.direct_messages(thread_id, amount=amount)
-    save_session(cl)
+    # Single API call — direct_thread returns both users and messages
+    thread = cl.direct_thread(thread_id, amount=amount)
 
     my_id = str(cl.user_id)
-
-    # Get thread for user lookup
-    thread = cl.direct_thread(thread_id)
     user_map = {str(u.pk): u.username for u in thread.users}
     title = ", ".join(u.username for u in thread.users) if thread.users else "unknown"
+    messages = thread.messages or []
 
     result = []
     for msg in messages:
@@ -122,6 +117,7 @@ COMMANDS = {
 
 
 def main():
+    init()
     cl = load_client()
 
     for line in sys.stdin:
