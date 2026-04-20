@@ -1,0 +1,18 @@
+[project]
+name = "instagram-tui"
+version = "0.1.0"
+description = "Write-only Instagram TUI — notes and DMs from the terminal"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "instagrapi>=2.1,<3",
+    "textual>=0.80",
+]
+
+[project.scripts]
+instagram-tui = "instagram_tui.__main__:main"
+inote = "instagram_tui.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
