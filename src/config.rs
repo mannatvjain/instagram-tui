@@ -65,8 +65,37 @@ impl ConfigStore {
         if path.exists() {
             fs::remove_file(&path).context("failed to remove session")?;
         }
+        let cache = self.cache_path();
+        if cache.exists() {
+            fs::remove_file(&cache).context("failed to remove cache")?;
+        }
         Ok(())
     }
+
+    fn cache_path(&self) -> PathBuf {
+        self.config_dir.join("dm_cache.json")
+    }
+
+    pub fn load_cache(&self) -> Option<DmCache> {
+        let path = self.cache_path();
+        if !path.exists() {
+            return None;
+        }
+        let data = fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&data).ok()
+    }
+
+    pub fn save_cache(&self, cache: &DmCache) -> Result<()> {
+        let data = serde_json::to_string(cache)?;
+        fs::write(self.cache_path(), &data).context("failed to write cache")?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DmCache {
+    pub threads: Vec<crate::api::DirectThread>,
+    pub messages: std::collections::HashMap<String, Vec<crate::api::DirectMessage>>,
 }
 
 #[cfg(test)]

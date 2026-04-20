@@ -10,7 +10,7 @@ use std::time::Duration;
 use tui_textarea::{Input, TextArea};
 
 use crate::api::{DirectMessage, DirectThread, InstagramClient};
-use crate::config::{ConfigStore, SessionConfig};
+use crate::config::{ConfigStore, DmCache};
 
 // ── Worker ──────────────────────────────────────────────────────────────────
 
@@ -24,37 +24,36 @@ pub enum WorkerCommand {
 pub enum WorkerEvent {
     NotePublished(Result<String>),
     ThreadsFetched(Result<Vec<DirectThread>>),
-    MessagesFetched(Result<(Vec<DirectMessage>, String)>),
+    MessagesFetched(String, Result<(Vec<DirectMessage>, String)>), // thread_id, result
     DMSent(Result<()>),
 }
 
 fn worker_loop(
-    api: InstagramClient,
+    mut api: InstagramClient,
     _store: ConfigStore,
-    session: SessionConfig,
     cmd_rx: mpsc::Receiver<WorkerCommand>,
     evt_tx: mpsc::Sender<WorkerEvent>,
 ) {
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             WorkerCommand::PublishNote(text) => {
-                let result = api.create_note(&session, &text);
+                let result = api.create_note(&text);
                 let _ = evt_tx.send(WorkerEvent::NotePublished(result));
             }
             WorkerCommand::FetchThreads => {
-                let result = api.get_direct_threads(&session, 20);
+                let result = api.get_direct_threads(20);
                 let _ = evt_tx.send(WorkerEvent::ThreadsFetched(result));
             }
             WorkerCommand::FetchMessages(thread_id) => {
-                let result = api.get_thread_messages(&session, &thread_id, 20);
-                let _ = evt_tx.send(WorkerEvent::MessagesFetched(result));
+                let result = api.get_thread_messages(&thread_id, 20);
+                let _ = evt_tx.send(WorkerEvent::MessagesFetched(thread_id, result));
             }
             WorkerCommand::SendDM(thread_id, text) => {
-                let result = api.send_dm(&session, &thread_id, &text);
+                let result = api.send_dm(&thread_id, &text);
                 let _ = evt_tx.send(WorkerEvent::DMSent(result));
                 // Auto-refresh after send
-                let result = api.get_thread_messages(&session, &thread_id, 20);
-                let _ = evt_tx.send(WorkerEvent::MessagesFetched(result));
+                let result = api.get_thread_messages(&thread_id, 20);
+                let _ = evt_tx.send(WorkerEvent::MessagesFetched(thread_id, result));
             }
         }
     }
@@ -91,6 +90,7 @@ pub struct App<'a> {
     threads: Vec<DirectThread>,
     thread_list_state: ListState,
     messages: Vec<DirectMessage>,
+    message_cache: std::collections::HashMap<String, (Vec<DirectMessage>, std::time::Instant)>,
     current_thread_id: String,
     current_thread_title: String,
     dm_input: String,
@@ -129,6 +129,7 @@ impl<'a> App<'a> {
             threads: Vec::new(),
             thread_list_state: ListState::default(),
             messages: Vec::new(),
+            message_cache: std::collections::HashMap::new(),
             current_thread_id: String::new(),
             current_thread_title: String::new(),
             dm_input: String::new(),
@@ -153,23 +154,33 @@ impl<'a> App<'a> {
                 if self.screen == Screen::DMList {
                     self.status = format!("{} conversations", self.threads.len());
                 }
+                // Prefetch messages for all threads that aren't cached
+                for t in &self.threads {
+                    if !self.message_cache.contains_key(&t.thread_id) {
+                        let _ = self.cmd_tx.send(WorkerCommand::FetchMessages(t.thread_id.clone()));
+                    }
+                }
             }
             WorkerEvent::ThreadsFetched(Err(e)) => {
                 self.status = format!("error: {}", e);
             }
-            WorkerEvent::MessagesFetched(Ok((msgs, title))) => {
-                self.messages = msgs;
-                if !title.is_empty() {
-                    self.current_thread_title = title;
+            WorkerEvent::MessagesFetched(tid, Ok((msgs, title))) => {
+                self.message_cache.insert(tid.clone(), (msgs.clone(), std::time::Instant::now()));
+                // Only update the visible screen if this is the active thread
+                if tid == self.current_thread_id {
+                    self.messages = msgs;
+                    if !title.is_empty() {
+                        self.current_thread_title = title;
+                    }
+                    self.dm_scroll = 0;
+                    self.status = format!(
+                        "{}  {} msgs",
+                        self.current_thread_title,
+                        self.messages.len()
+                    );
                 }
-                self.dm_scroll = 0;
-                self.status = format!(
-                    "{}  {} msgs",
-                    self.current_thread_title,
-                    self.messages.len()
-                );
             }
-            WorkerEvent::MessagesFetched(Err(e)) => {
+            WorkerEvent::MessagesFetched(_tid, Err(e)) => {
                 self.status = format!("error: {}", e);
             }
             WorkerEvent::DMSent(Ok(())) => {
@@ -288,8 +299,9 @@ fn draw_dm_list(frame: &mut ratatui::Frame, app: &mut App) {
         .iter()
         .map(|t| {
             let title = &t.thread_title;
-            let preview = if t.last_message.len() > 60 {
-                format!("{}...", &t.last_message[..60])
+            let preview = if t.last_message.chars().count() > 60 {
+                let truncated: String = t.last_message.chars().take(60).collect();
+                format!("{}...", truncated)
             } else {
                 t.last_message.clone()
             };
@@ -389,8 +401,17 @@ fn draw_dm_thread(frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(input, input_area);
 
     // Status
+    let status_color = if app.status.contains("sending") || app.status.contains("loading") {
+        Color::Yellow
+    } else if app.status.contains("sent!") {
+        Color::Green
+    } else if app.status.contains("error") {
+        Color::Red
+    } else {
+        Color::DarkGray
+    };
     let status = Paragraph::new(format!("  {}", app.status))
-        .style(Style::default().fg(Color::DarkGray));
+        .style(Style::default().fg(status_color));
     frame.render_widget(status, chunks[2]);
 
     // Footer
@@ -567,11 +588,33 @@ fn handle_dm_list_input(app: &mut App, key: event::KeyEvent) -> bool {
                     let tid = thread.thread_id.clone();
                     app.current_thread_title = thread.thread_title.clone();
                     app.current_thread_id = tid.clone();
-                    app.messages.clear();
                     app.dm_input.clear();
-                    app.status = format!("{}  loading...", thread.thread_title);
+                    app.dm_scroll = 0;
                     app.screen = Screen::DMThread(tid.clone());
-                    let _ = app.cmd_tx.send(WorkerCommand::FetchMessages(tid));
+
+                    // Show cached messages, only refetch if stale (>30s)
+                    let cache_ttl = std::time::Duration::from_secs(30);
+                    if let Some((cached, fetched_at)) = app.message_cache.get(&tid) {
+                        app.messages = cached.clone();
+                        if fetched_at.elapsed() < cache_ttl {
+                            app.status = format!(
+                                "{}  {} msgs",
+                                thread.thread_title,
+                                cached.len()
+                            );
+                        } else {
+                            app.status = format!(
+                                "{}  {} msgs (refreshing...)",
+                                thread.thread_title,
+                                cached.len()
+                            );
+                            let _ = app.cmd_tx.send(WorkerCommand::FetchMessages(tid));
+                        }
+                    } else {
+                        app.messages.clear();
+                        app.status = format!("{}  loading...", thread.thread_title);
+                        let _ = app.cmd_tx.send(WorkerCommand::FetchMessages(tid));
+                    }
                 }
             }
         }
@@ -656,72 +699,29 @@ pub fn run(
     terminal: &mut DefaultTerminal,
     api: InstagramClient,
     store: ConfigStore,
-    session: Option<SessionConfig>,
+    username: String,
 ) -> Result<()> {
-    let (cmd_tx, _cmd_rx) = mpsc::channel::<WorkerCommand>();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>();
+    let (evt_tx, evt_rx) = mpsc::channel::<WorkerEvent>();
 
-    let needs_login = session.is_none();
-    let mut session = session.unwrap_or_default();
-    let username = session.username.clone().unwrap_or_else(|| "unknown".to_string());
+    let mut app = App::new(username, cmd_tx);
 
-    let mut app = App::new(username, cmd_tx.clone());
-
-    if needs_login {
-        app.screen = Screen::Login;
-    }
-
-    // Login loop — runs before worker thread is spawned
-    if needs_login {
-        loop {
-            terminal
-                .draw(|frame| draw(frame, &mut app))
-                .context("failed to draw frame")?;
-
-            if event::poll(Duration::from_millis(50))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == event::KeyEventKind::Press {
-                        let quit = handle_input(&mut app, key);
-                        if quit {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-
-            if app.login_status == "login_requested" {
-                app.login_status = "logging in...".to_string();
-                terminal.draw(|frame| draw(frame, &mut app))?;
-
-                match api.login(&app.login_username, &app.login_password) {
-                    Ok(new_session) => {
-                        let _ = store.save_session(&new_session);
-                        app.username = new_session.username.clone().unwrap_or_default();
-                        session = new_session;
-                        app.screen = Screen::Home;
-                        break;
-                    }
-                    Err(e) => {
-                        app.login_status = format!("failed: {}", e);
-                    }
-                }
-            }
+    // Load disk cache
+    if let Some(cache) = store.load_cache() {
+        app.threads = cache.threads;
+        for (tid, msgs) in cache.messages {
+            app.message_cache.insert(tid, (msgs, std::time::Instant::now() - std::time::Duration::from_secs(999)));
         }
     }
 
-    // Now spawn worker thread with valid session
-    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>();
-    let (evt_tx, evt_rx) = mpsc::channel::<WorkerEvent>();
-    app.cmd_tx = cmd_tx;
-
-    // Prefetch DMs
+    // Prefetch DMs (will replace stale cache)
     let _ = app.cmd_tx.send(WorkerCommand::FetchThreads);
 
-    let worker_session = session.clone();
+    let save_store = ConfigStore::new().ok();
     std::thread::spawn(move || {
-        worker_loop(api, store, worker_session, cmd_rx, evt_tx);
+        worker_loop(api, store, cmd_rx, evt_tx);
     });
 
-    // Main event loop
     loop {
         terminal
             .draw(|frame| draw(frame, &mut app))
@@ -736,6 +736,16 @@ pub fn run(
                 if key.kind == event::KeyEventKind::Press {
                     let quit = handle_input(&mut app, key);
                     if quit {
+                        // Save cache to disk on quit
+                        if let Some(ref s) = save_store {
+                            let cache = DmCache {
+                                threads: app.threads.clone(),
+                                messages: app.message_cache.iter()
+                                    .map(|(k, (v, _))| (k.clone(), v.clone()))
+                                    .collect(),
+                            };
+                            let _ = s.save_cache(&cache);
+                        }
                         return Ok(());
                     }
                 }
@@ -1107,7 +1117,8 @@ mod tests {
         let msgs = vec![DirectMessage {
             user_id: "alice".into(), text: "hi".into(), timestamp: String::new(), is_sender: false,
         }];
-        app.handle_worker_event(WorkerEvent::MessagesFetched(Ok((msgs, "Alice".into()))));
+        app.current_thread_id = "t1".into();
+        app.handle_worker_event(WorkerEvent::MessagesFetched("t1".into(), Ok((msgs, "Alice".into()))));
         assert_eq!(app.messages.len(), 1);
         assert_eq!(app.current_thread_title, "Alice");
     }

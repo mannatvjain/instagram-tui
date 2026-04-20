@@ -25,20 +25,14 @@ fn main() -> Result<()> {
 
     let api = api::InstagramClient::new()?;
 
-    // Try to restore session
+    // Get username from saved session
     let session = store.load_session();
-    let session = if let Some(ref s) = session {
-        if s.session_id.is_some() {
-            Some(s.clone())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let username = session
+        .and_then(|s| s.username)
+        .unwrap_or_else(|| "unknown".to_string());
 
     let mut terminal = ratatui::init();
-    let result = tui::run(&mut terminal, api, store, session);
+    let result = tui::run(&mut terminal, api, store, username);
     ratatui::restore();
 
     result
