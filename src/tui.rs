@@ -19,6 +19,7 @@ pub enum WorkerCommand {
     FetchThreads,
     FetchMessages(String), // thread_id
     SendDM(String, String), // thread_id, text
+    PollThreads,            // background poll — same as FetchThreads but tagged differently
 }
 
 pub enum WorkerEvent {
@@ -26,6 +27,7 @@ pub enum WorkerEvent {
     ThreadsFetched(Result<Vec<DirectThread>>),
     MessagesFetched(String, Result<(Vec<DirectMessage>, String)>), // thread_id, result
     DMSent(Result<()>),
+    PollResult(Result<Vec<DirectThread>>),
 }
 
 fn worker_loop(
@@ -48,12 +50,19 @@ fn worker_loop(
                 let result = api.get_thread_messages(&thread_id, 20);
                 let _ = evt_tx.send(WorkerEvent::MessagesFetched(thread_id, result));
             }
+            WorkerCommand::PollThreads => {
+                let result = api.get_direct_threads(20);
+                let _ = evt_tx.send(WorkerEvent::PollResult(result));
+            }
             WorkerCommand::SendDM(thread_id, text) => {
                 let result = api.send_dm(&thread_id, &text);
+                let ok = result.is_ok();
                 let _ = evt_tx.send(WorkerEvent::DMSent(result));
-                // Auto-refresh after send
-                let result = api.get_thread_messages(&thread_id, 20);
-                let _ = evt_tx.send(WorkerEvent::MessagesFetched(thread_id, result));
+                // Only refresh if send succeeded
+                if ok {
+                    let result = api.get_thread_messages(&thread_id, 20);
+                    let _ = evt_tx.send(WorkerEvent::MessagesFetched(thread_id, result));
+                }
             }
         }
     }
@@ -87,6 +96,7 @@ pub struct App<'a> {
     login_status: String,
 
     // DMs
+    unread: std::collections::HashSet<String>, // thread_ids with new messages
     threads: Vec<DirectThread>,
     thread_list_state: ListState,
     messages: Vec<DirectMessage>,
@@ -126,6 +136,7 @@ impl<'a> App<'a> {
             login_password: String::new(),
             login_status: String::new(),
 
+            unread: std::collections::HashSet::new(),
             threads: Vec::new(),
             thread_list_state: ListState::default(),
             messages: Vec::new(),
@@ -183,6 +194,26 @@ impl<'a> App<'a> {
             WorkerEvent::MessagesFetched(_tid, Err(e)) => {
                 self.status = format!("error: {}", e);
             }
+            WorkerEvent::PollResult(Ok(new_threads)) => {
+                // Compare last messages to find new activity
+                let old_msgs: std::collections::HashMap<String, String> = self
+                    .threads
+                    .iter()
+                    .map(|t| (t.thread_id.clone(), t.last_message.clone()))
+                    .collect();
+                for t in &new_threads {
+                    if let Some(old_msg) = old_msgs.get(&t.thread_id) {
+                        if *old_msg != t.last_message {
+                            self.unread.insert(t.thread_id.clone());
+                        }
+                    } else {
+                        // New thread we haven't seen
+                        self.unread.insert(t.thread_id.clone());
+                    }
+                }
+                self.threads = new_threads;
+            }
+            WorkerEvent::PollResult(Err(_)) => {}
             WorkerEvent::DMSent(Ok(())) => {
                 self.status = format!("{}  sent!", self.current_thread_title);
                 self.dm_input.clear();
@@ -298,7 +329,17 @@ fn draw_dm_list(frame: &mut ratatui::Frame, app: &mut App) {
         .threads
         .iter()
         .map(|t| {
-            let title = &t.thread_title;
+            let is_unread = app.unread.contains(&t.thread_id);
+            let title = if is_unread {
+                format!("* {}", t.thread_title)
+            } else {
+                t.thread_title.clone()
+            };
+            let title_style = if is_unread {
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            };
             let preview = if t.last_message.chars().count() > 60 {
                 let truncated: String = t.last_message.chars().take(60).collect();
                 format!("{}...", truncated)
@@ -307,8 +348,8 @@ fn draw_dm_list(frame: &mut ratatui::Frame, app: &mut App) {
             };
             ListItem::new(vec![
                 Line::from(Span::styled(
-                    title.clone(),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    title,
+                    title_style,
                 )),
                 Line::from(Span::styled(preview, Style::default().fg(Color::DarkGray))),
             ])
@@ -591,6 +632,7 @@ fn handle_dm_list_input(app: &mut App, key: event::KeyEvent) -> bool {
                     let tid = thread.thread_id.clone();
                     app.current_thread_title = thread.thread_title.clone();
                     app.current_thread_id = tid.clone();
+                    app.unread.remove(&tid);
                     app.dm_input.clear();
                     app.dm_scroll = 0;
                     app.screen = Screen::DMThread(tid.clone());
@@ -641,6 +683,14 @@ fn handle_dm_thread_input(app: &mut App, key: event::KeyEvent) -> bool {
         KeyCode::Enter => {
             let text = app.dm_input.trim().to_string();
             if !text.is_empty() {
+                // Optimistically add message to display
+                app.messages.push(DirectMessage {
+                    user_id: "you".to_string(),
+                    text: text.clone(),
+                    timestamp: String::new(),
+                    is_sender: true,
+                });
+                app.dm_scroll = 0;
                 app.status = format!("{}  sending...", app.current_thread_title);
                 let _ = app.cmd_tx.send(WorkerCommand::SendDM(
                     app.current_thread_id.clone(),
@@ -725,6 +775,9 @@ pub fn run(
         worker_loop(api, store, cmd_rx, evt_tx);
     });
 
+    let mut last_poll = std::time::Instant::now();
+    let poll_interval = std::time::Duration::from_secs(30);
+
     loop {
         terminal
             .draw(|frame| draw(frame, &mut app))
@@ -732,6 +785,12 @@ pub fn run(
 
         while let Ok(evt) = evt_rx.try_recv() {
             app.handle_worker_event(evt);
+        }
+
+        // Background poll for new messages
+        if last_poll.elapsed() >= poll_interval {
+            let _ = app.cmd_tx.send(WorkerCommand::PollThreads);
+            last_poll = std::time::Instant::now();
         }
 
         if event::poll(Duration::from_millis(50))? {
