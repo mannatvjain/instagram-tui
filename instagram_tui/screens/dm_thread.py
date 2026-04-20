@@ -178,7 +178,7 @@ class DMThreadScreen(Screen):
         except LoginRequired:
             self.app.call_from_thread(self.app.handle_login_required)
         except Exception as e:
-            self._set_status(f"error: {e}")
+            self._set_status(f"error [{type(e).__name__}]: {e}")
 
     def _set_status(self, msg: str) -> None:
         def _update() -> None:

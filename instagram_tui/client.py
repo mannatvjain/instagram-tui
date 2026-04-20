@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 from instagrapi import Client
 from instagrapi.exceptions import LoginRequired
 
@@ -11,6 +13,7 @@ class InstagramClient:
         self.config = config
         self.cl = Client()
         self._logged_in = False
+        self._lock = threading.Lock()
 
     def restore_session(self) -> bool:
         session = self.config.get_session()
@@ -45,20 +48,27 @@ class InstagramClient:
             raise ValueError("Note cannot be empty")
         if len(text) > 60:
             raise ValueError(f"Note too long: {len(text)}/60 characters")
-        result = self.cl.create_note(text, audience)
-        self.config.save_session(self.cl.get_settings())
+        with self._lock:
+            result = self.cl.create_note(text, audience)
+            self.config.save_session(self.cl.get_settings())
         return str(result.id)
 
     def get_direct_threads(self, amount: int = 20) -> list:
-        try:
-            threads = self.cl.direct_threads(amount=amount)
-        except LoginRequired:
-            raise
+        with self._lock:
+            try:
+                threads = self.cl.direct_threads(amount=amount)
+            except LoginRequired:
+                raise
+            self.config.save_session(self.cl.get_settings())
         return threads
 
     def get_thread_messages(self, thread_id: str, amount: int = 20) -> list:
-        return self.cl.direct_messages(thread_id, amount=amount)
+        with self._lock:
+            messages = self.cl.direct_messages(thread_id, amount=amount)
+            self.config.save_session(self.cl.get_settings())
+        return messages
 
     def send_dm(self, thread_id: str, text: str) -> None:
-        self.cl.direct_send(text, thread_ids=[int(thread_id)])
-        self.config.save_session(self.cl.get_settings())
+        with self._lock:
+            self.cl.direct_answer(int(thread_id), text)
+            self.config.save_session(self.cl.get_settings())
